@@ -58,42 +58,31 @@ async def analyze_fraud(
         # Include URL in text for analysis
         text = f"{text} {request.url}".strip()
 
-    # Step 1: Extract entities
+    # Step 1: Extract entities (still needed for structured response/DB)
     entities = extract_entities(text)
 
-    # Step 2: Extract fraud signals
-    signals = extract_fraud_signals(text, entities)
-
-    # Step 3: Calculate signal score
-    signal_score = calculate_signal_score(signals)
-
-    # Step 4: Fuse scores
-    # In P0, only signal_score is available.
-    # text_model_score, semantic_similarity_score, etc. come in later phases.
-    fused_score = fuse_risk_scores(
-        signal_score=signal_score,
-        text_model_score=None,  # Phase 2b: ML classifier
-        semantic_similarity_score=None,  # Phase 5: semantic retrieval
-        behaviour_anomaly_score=None,  # Phase 6: behaviour model
-        entity_reputation_score=None,  # Phase 5: entity reputation
-    )
-
-    # Step 5: Risk level
+    # Step 2: Invoke LangGraph Agent (Evidence -> Score -> Explain)
+    from app.services.orchestrator import analyze_fraud_with_agent
+    
+    agent_result = analyze_fraud_with_agent(text)
+    
+    fused_score = agent_result["risk_score"]
+    policy_action_str = agent_result["action"]
+    
+    try:
+        policy_action = PolicyAction(policy_action_str)
+    except ValueError:
+        policy_action = PolicyAction.WARN
+        
     risk_level = classify_risk_level(fused_score)
+    _, pause_duration = determine_policy_action(risk_level, fused_score, request.transaction_context)
+    
+    # Pack signals back into FraudSignals model for the DB/Response
+    signals = extract_fraud_signals(text, entities) # Still extract for structural parity
 
-    # Step 6: Policy action
-    policy_action, pause_duration = determine_policy_action(
-        risk_level, fused_score, request.transaction_context
-    )
-
-    # Step 7: Explanation
-    explanation = build_explanation(
-        signals=signals,
-        entities=entities,
-        risk_score=fused_score,
-        risk_level=risk_level,
-        policy_action=policy_action,
-        transaction_context=request.transaction_context,
+    explanation = RiskExplanation(
+        summary=agent_result["explanation"],
+        details=["Analyzed via ML and RAG Intelligence."]
     )
 
     # Step 8: Persist
@@ -104,12 +93,12 @@ async def analyze_fraud(
         extracted_text=text,
         extracted_entities=entities.model_dump(),
         fraud_signals=signals.model_dump(),
-        text_model_score=None,
-        semantic_similarity_score=None,
+        text_model_score=agent_result.get("raw_scores", {}).get("ml_score"),
+        semantic_similarity_score=agent_result.get("raw_scores", {}).get("semantic_score"),
         behaviour_anomaly_score=None,
         entity_reputation_score=None,
         fused_risk_score=fused_score,
-        calibrated_risk=fused_score,  # Will be calibrated in Phase 7
+        calibrated_risk=fused_score, 
         risk_level=risk_level.value,
         policy_action=policy_action.value,
         pause_duration_seconds=pause_duration,
@@ -120,9 +109,8 @@ async def analyze_fraud(
     await db.flush()
 
     logger.info(
-        f"Fraud analysis completed: id={analysis.id} "
-        f"risk={fused_score:.3f} level={risk_level.value} "
-        f"action={policy_action.value} signals={signals.signal_count}"
+        f"Fraud analysis completed (Agentic): id={analysis.id} "
+        f"risk={fused_score:.3f} level={risk_level.value} action={policy_action.value}"
     )
 
     # Step 9: Response
@@ -137,16 +125,15 @@ async def analyze_fraud(
         extracted_entities=entities,
         fraud_signals=signals,
         raw_scores={
-            "signal_score": round(signal_score, 4),
-            "text_model_score": None,
-            "semantic_similarity_score": None,
+            "signal_score": None,
+            "text_model_score": agent_result.get("raw_scores", {}).get("ml_score"),
+            "semantic_similarity_score": agent_result.get("raw_scores", {}).get("semantic_score"),
             "behaviour_anomaly_score": None,
             "entity_reputation_score": None,
             "fused_risk_score": round(fused_score, 4),
         },
         created_at=datetime.now(timezone.utc),
     )
-
 
 async def get_analysis(analysis_id: str, db: AsyncSession) -> Optional[FraudAnalysis]:
     """Retrieve a fraud analysis by ID."""
